@@ -1,0 +1,179 @@
+name: Update target repos on file changes
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  update-target-repos:
+    runs-on: ubuntu-latest
+
+    # Allows to push changes to the target repositories
+    permissions:
+      contents: write
+
+    env:
+      PAT: ${{ secrets.PAT }}
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          # Get full commit history in order to compare previous revs
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global push.autoSetupRemote true
+          git config --global push.default current
+
+      - name: Authenticate with GitHub CLI
+        run: |
+          unset GH_TOKEN
+          echo $PAT | gh auth login --with-token
+          gh auth setup-git
+      
+      - name: Get previous commit info
+        id: previous_commit
+        run: |
+          if [ -f data/last_processed_commit.json ]; then
+            PREV=$(jq -r '.commit' data/last_processed_commit.json)
+          else
+            PREV=$(git rev-parse HEAD~1)
+          fi
+
+          echo "Previous commit : $PREV"
+          echo "prev_commit=$PREV" >> $GITHUB_OUTPUT
+
+      - name: Determine changed files
+        id: changed_files
+        run: |
+          WORKSPACE="$GITHUB_WORKSPACE"
+          PREV=${{ steps.previous_commit.outputs.prev_commit }}
+          CHANGED_MAPPING=""
+
+          if [ -z "$PREV" ] || ! git cat-file -e "$PREV" 2>/dev/null || git diff --name-only "$PREV" HEAD | grep -q "^data/repos.json\$"; then
+            echo "PREV is empty or the data/repos.json file has changed, initializing all files"
+
+            # All files need to be processed
+            for src in $(jq -r 'keys[]' data/files_to_check.json); do
+              dest=$(jq -r --arg key "$src" '.[$key]' data/files_to_check.json)
+              CHANGED_MAPPING="${CHANGED_MAPPING}${WORKSPACE}/${src}::${dest};"
+            done
+          else
+            # Iterate over each key and only add if file changed
+            for src in $(jq -r 'keys[]' data/files_to_check.json); do
+              if git diff --name-only "$PREV" HEAD | grep -q "^$src\$"; then
+                dest=$(jq -r --arg key "$src" '.[$key]' data/files_to_check.json)
+                CHANGED_MAPPING="${CHANGED_MAPPING}${WORKSPACE}/${src}::${dest};"
+              fi
+            done
+          fi
+
+          echo "Changed files : $CHANGED_MAPPING"
+          echo "changed_mapping=$CHANGED_MAPPING" >> $GITHUB_OUTPUT
+
+      - name: Update target repositories
+        if: steps.changed_files.outputs.changed_mapping != ''
+        env:
+          ORG: EDM115
+        run: |
+          # Iterate through each target repository
+          repos=$(jq -r '.[]' data/repos.json)
+          repos_list=""
+
+          for r in $repos; do
+            if [[ $r == *"*"* ]]; then
+              # Extract the wildcard part and replace it with a regex pattern
+              WILDCARD_REPO=$(echo $r | sed 's/\*/.*/g')
+              # Get all matching repositories using GitHub CLI
+              MATCHING_REPOS=$(gh api -X GET orgs/$ORG/repos --paginate --jq ".[] | select(.name | test(\"$WILDCARD_REPO\")) | .full_name")
+              # Append the matching repositories to the repos_list
+              repos_list="$repos_list $MATCHING_REPOS"
+            else
+              # If the repo doesn't contain a wildcard, just add it to the list
+              repos_list="$repos_list $ORG/$r"
+            fi
+          done
+
+          for re in $repos_list; do
+            # Remove the organization name from the repo name
+            repo=$(echo $re | sed "s|$ORG/||I")
+            echo -e "\n--------------------\n"
+            echo "Processing repository : $ORG/$repo"
+            # Clone the target repo
+            gh repo clone $ORG/$repo /tmp/$repo -- --depth=1 --quiet
+            cd /tmp/$repo
+            # Get the default branch name from the remote
+            DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+
+            if [ -z "$DEFAULT_BRANCH" ]; then
+              # Assume the ORG's convention for default branch name
+              DEFAULT_BRANCH="master"
+            fi
+
+            echo "Default branch : $DEFAULT_BRANCH"
+            # Create a new branch
+            BRANCH="update-github-template-files"
+
+            # Check if the branch already exists on the remote
+            if git ls-remote --heads origin $BRANCH | grep -q "$BRANCH"; then
+              echo "Branch $BRANCH exists on remote, checking it out and pulling latest changes"
+              git checkout $BRANCH
+              git pull origin $BRANCH
+              PR_EXISTS=true
+            else
+              echo "Branch $BRANCH does not exist, creating a new branch from $DEFAULT_BRANCH"
+              git checkout -b $BRANCH
+              PR_EXISTS=false
+            fi
+
+            # Initialize a variable for the commit message
+            UPDATED_FILES=""
+
+            # For each changed file (format: source::destination;)
+            for pair in $(echo "${{ steps.changed_files.outputs.changed_mapping }}" | tr ';' '\n'); do
+              if [ -z "$pair" ]; then continue; fi
+
+              src=$(echo "$pair" | awk -F "::" '{print $1}')
+              dest=$(echo "$pair" | awk -F "::" '{print $2}')
+              echo "Updating $src to $dest in repo $ORG/$repo"
+              mkdir -p "$(dirname "$dest")"
+              cp "$src" "$dest"
+              git add "$dest"
+              UPDATED_FILES="${UPDATED_FILES}${dest}\n"
+            done
+
+            # Commit and push if there are changes
+            if ! git diff-index --quiet HEAD --; then
+              COMMIT_TITLE="chore: update config files [skip ci]"
+              echo -e "Updated files :\n$UPDATED_FILES"
+              git commit -m "$COMMIT_TITLE" -m "$(echo -e "$UPDATED_FILES")"
+              git push origin $BRANCH 2>&1 | sed -e 's/^remote: //'
+
+              # Only create a PR if this branch was newly created
+              if [ "$PR_EXISTS" = false ]; then
+                gh pr create --repo "$ORG/$repo" \
+                             --title "$COMMIT_TITLE" \
+                             --body $'Updated files :\n'"$(echo -e "$UPDATED_FILES")" \
+                             --base "$DEFAULT_BRANCH" --head $BRANCH
+              fi
+            else
+              echo "No changes to commit in $ORG/$repo"
+            fi
+
+            cd /tmp
+            rm -rf "/tmp/$repo"
+          done
+
+      - name: Update last processed commit JSON
+        if: steps.changed_files.outputs.changed_mapping != ''
+        run: |
+          CURRENT=$(git rev-parse HEAD)
+          echo "{ \"commit\": \"$CURRENT\" }" > data/last_processed_commit.json
+          git add data/last_processed_commit.json
+          git commit -m "Update last processed commit [skip ci]" || echo "No changes to commit"
+          git push
