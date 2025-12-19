@@ -7,7 +7,7 @@ on:
 
 jobs:
   update-target-repos:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
 
     # Allows to push changes to the target repositories
     permissions:
@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout source repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           # Get full commit history in order to compare previous revs
           fetch-depth: 0
